@@ -1,12 +1,10 @@
-import torch
+import os
+
 from pytorch_lightning.cli import LightningCLI
 from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
-from pytorch_lightning.strategies import DDPStrategy
-
-from lightning import AutoregressiveLM, DiffusionLM
-from lightning.mock import MockData
-from lightning.data import ConcatData
-
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "2"
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 def cli_main():
     cli = LightningCLI(

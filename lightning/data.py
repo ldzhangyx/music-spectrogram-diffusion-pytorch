@@ -3,12 +3,10 @@ import torch
 from torch.utils.data import DataLoader, ConcatDataset, default_collate, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from itertools import chain
-from data.musicnet import MusicNet
-from data.maestro import Maestro
-from data.urmp import URMP
-from data.slakh import Slakh2100
-from data.guitarset import GuitarSet
+from data.music4all import Music4All
 from preprocessor.event_codec import Codec
+import pickle
+import os
 
 
 def get_padding_collate_fn(output_size: int):
@@ -24,137 +22,118 @@ def get_padding_collate_fn(output_size: int):
         else:
             seqs = pad_sequence(seqs, batch_first=True, padding_value=0)
         return seqs, *rest
+
     return collate_fn
+
+
+def load_dataset(path):
+    return pickle.load(open(path, 'rb'))
+
+
+def save_dataset(dataset, path):
+    pickle.dump(dataset, open(path, 'wb'), protocol=pickle.HIGHEST_PROTOCOL)
 
 
 class ConcatData(pl.LightningDataModule):
     def __init__(self,
-                 batch_size: int,
+                 batch_size: int = 32,
                  midi_output_size: int = 2048,
-                 with_context: bool = False,
+                 with_context: bool = True,
                  sample_rate: int = 16000,
                  segment_length: int = 81920,
-                 musicnet_path: str = None,
-                 maestro_path: str = None,
-                 slakh_path: str = None,
-                 guitarset_path: str = None,
-                 urmp_wav_path: str = None,
-                 urmp_midi_path: str = None,
-                 sampling_temperature: float = 0.3
+                 music4all_path: str = "/import/c4dm-04/yz007/music4all/",
+                 sampling_temperature: float = 0.3,
+                 cache=False,
+                 cache_folder="/import/c4dm-04/yz007/"
                  ):
         super().__init__()
         self.save_hyperparameters()
+        [self.batch_size, self.midi_output_size, self.with_context, self.sample_rate, self.segment_length,
+         self.music4all_path, self.sampling_temperature] = batch_size, midi_output_size, with_context, sample_rate, \
+            segment_length, music4all_path, sampling_temperature
+        self.cache = cache
+        self.cache_folder = cache_folder
 
     def setup(self, stage=None):
         resolution = 100
-        segment_length_in_time = self.hparams.segment_length / self.hparams.sample_rate
+        segment_length_in_time = self.segment_length / self.sample_rate
         codec = Codec(int(segment_length_in_time * resolution + 1))
 
         factory_kwargs = {
             'codec': codec,
             'resolution': resolution,
-            'sample_rate': self.hparams.sample_rate,
-            'segment_length': self.hparams.segment_length,
-            'with_context': self.hparams.with_context,
+            'sample_rate': self.sample_rate,
+            'segment_length': self.segment_length,
+            'with_context': self.with_context,
         }
 
         if stage == "fit":
-            train_datasets = []
-            if self.hparams.musicnet_path is not None:
-                train_datasets.append(
-                    MusicNet(path=self.hparams.musicnet_path, split='train', **factory_kwargs))
 
-            if self.hparams.maestro_path is not None:
-                train_datasets.append(
-                    Maestro(path=self.hparams.maestro_path, split='train', **factory_kwargs))
+            if self.cache and os.path.exists(f"{self.cache_folder}/fit.pkl"):
+                self.train_dataset = load_dataset(f"{self.cache_folder}/fit.pkl")
+            else:
+                train_datasets = []
+                if self.music4all_path is not None:
+                    train_datasets.append(
+                        Music4All(path=self.music4all_path, split='train', **factory_kwargs))
 
-            if self.hparams.urmp_wav_path is not None and self.hparams.urmp_midi_path is not None:
-                train_datasets.append(
-                    URMP(wav_path=self.hparams.urmp_wav_path, midi_path=self.hparams.urmp_midi_path, split='train', **factory_kwargs))
+                self.train_dataset = ConcatDataset(train_datasets)
+                if self.cache:
+                    save_dataset(self.train_dataset, f"{self.cache_folder}/fit.pkl")
 
-            if self.hparams.slakh_path is not None:
-                train_datasets.append(
-                    Slakh2100(path=self.hparams.slakh_path, split='train', **factory_kwargs))
-
-            if self.hparams.guitarset_path is not None:
-                train_datasets.append(
-                    GuitarSet(path=self.hparams.guitarset_path, split='train', **factory_kwargs))
-
-            train_num_samples = [len(dataset) for dataset in train_datasets]
+            train_num_samples = [len(dataset) for dataset in self.train_dataset.datasets]
             dataset_weights = [
-                x ** self.hparams.sampling_temperature for x in train_num_samples]
-
+                x ** self.sampling_temperature for x in train_num_samples]
             print("Train dataset sizes: ", train_num_samples)
             print("Train dataset weights: ", dataset_weights)
-
             self.sampler_weights = list(
                 chain.from_iterable(
-                    [dataset_weights[i] / train_num_samples[i]] * train_num_samples[i] for i in range(len(train_num_samples))
+                    [dataset_weights[i] / train_num_samples[i]] * train_num_samples[i] for i in
+                    range(len(train_num_samples))
                 )
             )
 
-            self.train_dataset = ConcatDataset(train_datasets)
-
         if stage == "validate" or stage == "fit":
-            val_datasets = []
-            if self.hparams.musicnet_path is not None:
-                val_datasets.append(
-                    MusicNet(path=self.hparams.musicnet_path, split='val', **factory_kwargs))
+            if self.cache and os.path.exists(f"{self.cache_folder}/validate.pkl"):
+                self.val_dataset = load_dataset(f"{self.cache_folder}/validate.pkl")
+            else:
+                val_datasets = []
+                if self.music4all_path is not None:
+                    val_datasets.append(
+                        Music4All(path=self.music4all_path, split='val', **factory_kwargs))
 
-            if self.hparams.maestro_path is not None:
-                val_datasets.append(
-                    Maestro(path=self.hparams.maestro_path, split='val', **factory_kwargs))
+                self.val_dataset = ConcatDataset(val_datasets)
+                if self.cache:
+                    save_dataset(self.val_dataset, f"{self.cache_folder}/validate.pkl")
 
-            if self.hparams.urmp_wav_path is not None and self.hparams.urmp_midi_path is not None:
-                val_datasets.append(
-                    URMP(wav_path=self.hparams.urmp_wav_path, midi_path=self.hparams.urmp_midi_path, split='val', **factory_kwargs))
-
-            if self.hparams.slakh_path is not None:
-                val_datasets.append(
-                    Slakh2100(path=self.hparams.slakh_path, split='val', **factory_kwargs))
-
-            if self.hparams.guitarset_path is not None:
-                val_datasets.append(
-                    GuitarSet(path=self.hparams.guitarset_path, split='val', **factory_kwargs))
-
-            self.val_dataset = ConcatDataset(val_datasets)
 
         if stage == "test":
-            test_datasets = []
-            if self.hparams.musicnet_path is not None:
-                test_datasets.append(
-                    MusicNet(path=self.hparams.musicnet_path, split='test', **factory_kwargs))
+            if self.cache and os.path.exists(f"{self.cache_folder}/test.pkl"):
+                self.test_dataset = load_dataset(f"{self.cache_folder}/test.pkl")
+            else:
+                test_datasets = []
+                if self.music4all_path is not None:
+                    test_datasets.append(
+                        Music4All(path=self.music4all_path, split='test', **factory_kwargs))
 
-            if self.hparams.maestro_path is not None:
-                test_datasets.append(
-                    Maestro(path=self.hparams.maestro_path, split='test', **factory_kwargs))
-
-            if self.hparams.urmp_wav_path is not None and self.hparams.urmp_midi_path is not None:
-                test_datasets.append(
-                    URMP(wav_path=self.hparams.urmp_wav_path, midi_path=self.hparams.urmp_midi_path, split='test', **factory_kwargs))
-
-            if self.hparams.slakh_path is not None:
-                test_datasets.append(
-                    Slakh2100(path=self.hparams.slakh_path, split='test', **factory_kwargs))
-
-            if self.hparams.guitarset_path is not None:
-                test_datasets.append(
-                    GuitarSet(path=self.hparams.guitarset_path, split='test', **factory_kwargs))
-
-            self.test_dataset = ConcatDataset(test_datasets)
+                self.test_dataset = ConcatDataset(test_datasets)
+                if self.cache:
+                    save_dataset(self.test_dataset, f"{self.cache_folder}/test.pkl")
 
     def train_dataloader(self):
-        collate_fn = get_padding_collate_fn(self.hparams.midi_output_size)
+        # collate_fn = get_padding_collate_fn(self.midi_output_size)
         sampler = WeightedRandomSampler(self.sampler_weights, len(
             self.sampler_weights), replacement=True)
-        return DataLoader(self.train_dataset, batch_size=self.hparams.batch_size,
+        return DataLoader(self.train_dataset, batch_size=self.batch_size,
                           sampler=sampler,
-                          shuffle=False, num_workers=4, collate_fn=collate_fn)
+                          shuffle=False, num_workers=2)  # , collate_fn=collate_fn)
 
     def val_dataloader(self):
-        collate_fn = get_padding_collate_fn(self.hparams.midi_output_size)
-        return DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
+        # collate_fn = get_padding_collate_fn(self.midi_output_size)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
+                          num_workers=2)  # , collate_fn=collate_fn)
 
     def test_dataloader(self):
-        collate_fn = get_padding_collate_fn(self.hparams.midi_output_size)
-        return DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
+        # collate_fn = get_padding_collate_fn(self.midi_output_size)
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False,
+                          num_workers=2)  # , collate_fn=collate_fn)

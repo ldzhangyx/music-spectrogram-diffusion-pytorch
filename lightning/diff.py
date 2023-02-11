@@ -1,4 +1,6 @@
 from collections import defaultdict
+
+import numpy as np
 import pytorch_lightning as pl
 import torch_optimizer as optim
 import torch
@@ -66,10 +68,7 @@ class DiffusionLM(pl.LightningModule):
             layer_norm_eps=layer_norm_eps, norm_first=norm_first, dim_feedforward=dim_feedforward
         )
 
-        self.mel = nn.Sequential(
-            MelFeature(window_fn=torch.hann_window, **mel_kwargs),
-            get_scaler()
-        )
+        self.mel = MelFeature(window_fn=torch.hann_window, **mel_kwargs)
 
     def get_log_snr(self, t):
         """Compute Cosine log SNR for a given time step."""
@@ -77,12 +76,14 @@ class DiffusionLM(pl.LightningModule):
         a = math.atan(math.exp(-0.5 * self.logsnr_min)) - b
         return -2.0 * torch.log(torch.tan(a * t + b))
 
-    def get_training_inputs(self, x: torch.Tensor, uniform: bool = False):
+    def get_training_inputs(self, x: torch.Tensor, uniform: bool = False, minibatch_sync=False):
         N = x.shape[0]
         if uniform:
             t = torch.linspace(0, 1, N).to(x.device)
         else:
             t = x.new_empty(N).uniform_(0, 1)
+        if minibatch_sync:  # this setting is only for return a random but same t for all samples in a minibatch
+            t = t[0] * torch.ones_like(t)
         log_snr = self.get_log_snr(t)
         alpha, var = log_snr2as(log_snr)
         sigma = var.sqrt()
@@ -90,7 +91,11 @@ class DiffusionLM(pl.LightningModule):
         z_t = x * alpha[:, None, None] + sigma[:, None, None] * noise
         return z_t, t, noise
 
-    def forward(self, midi: Tensor, seq_length=256, mel_context=None, wav_context=None, rescale=True, T=1000, verbose=True):
+    def forward(self, batch_size=4, seq_length=256, mel_context=None,
+                wav_context=None, rescale=True, T=1000, verbose=True,
+                fast_sampling=False, fast_sampling_schedule=None,
+                inject_grad_model=None, text_input=None,
+                stop_t=-1):
         if wav_context is not None:
             context = self.mel(wav_context)
         elif mel_context is not None:
@@ -98,63 +103,76 @@ class DiffusionLM(pl.LightningModule):
         else:
             context = None
 
-        t = torch.linspace(0, 1, T).to(self.device)
-        log_snr = self.get_log_snr(t)
+        t = torch.linspace(0, 1, T).to(self.device)  # t from 0 to 1
+        log_snr = self.get_log_snr(t)  # from 20 to -20
         log_alpha, log_var = log_snr2logas(log_snr)
 
-        var = log_var.exp()
-        alpha = log_alpha.exp()
-        alpha_st = torch.exp(log_alpha[:-1] - log_alpha[1:])
+        var = log_var.exp()  # noise schedule, increasing, from 0 to 1
+        alpha = log_alpha.exp()  # should be decreasing, it is cum alpha, from 1 to 0
+        alpha_st = torch.exp(log_alpha[:-1] - log_alpha[1:])  # a trick to calculate {1 / alpha_t}
         c = -torch.expm1(log_snr[1:] - log_snr[:-1])
         c.relu_()
 
+        # z_t start from a random noise.
         z_t = torch.randn(
-            midi.shape[0], seq_length, self.output_dim, device=self.device)
+            batch_size, seq_length, self.output_dim, device=self.device)
 
         dropout_mask = torch.tensor(
-            [0] * midi.shape[0] + [1] * midi.shape[0]).bool().to(self.device)
-        t = torch.broadcast_to(t, (midi.shape[0] * 2, T))
-        midi = midi.repeat(2, 1)
+            [0] * batch_size + [1] * batch_size).bool().to(self.device)
+        t = torch.broadcast_to(t, (batch_size * 2, T))
         if context is not None:
             context = context.repeat(2, 1, 1)
 
-        for t_idx in tqdm(range(T - 1, -1, -1), disable=not verbose):
+        for t_idx in tqdm(range(T - 1, -1, -1), disable=True):
             s_idx = t_idx - 1
-            noise_hat = self.model(midi, z_t.repeat(
+
+            # if fast_sampling and t_idx not in T_fast and s_idx > 0:
+            #     continue
+
+            # calculate the noise prediction
+            noise_hat = self.model(z_t.repeat(
                 2, 1, 1), t[:, t_idx], context, dropout_mask=dropout_mask)
             cond_noise_hat, uncond_noise_hat = noise_hat.chunk(2, dim=0)
-            noise_hat = cond_noise_hat * self.cfg_weighting + \
-                uncond_noise_hat * (1 - self.cfg_weighting)
+            noise_hat = cond_noise_hat * self.cfg_weighting + uncond_noise_hat * (1 - self.cfg_weighting)
+            # noise_hat = uncond_noise_hat  # we don't use cond noise
 
-            noise_hat = noise_hat.clamp_(
-                (z_t - alpha[t_idx]) * var[t_idx].rsqrt(),
+            if inject_grad_model: # CLAP guidance
+                zt_input = z_t.clone()
+                zt_input.requires_grad = True
+                loss_grad = inject_grad_model.get_gradient_to_input(zt_input, text_input, t_idx / T)
+                grad = torch.autograd.grad(loss_grad, zt_input, allow_unused=True)[0]
+                noise_hat = noise_hat + 16 * grad
+                
+            noise_hat = noise_hat.clamp(
+                (z_t - alpha[t_idx]) * var[t_idx].rsqrt(),  # rsqrt = 1 / sqrt
                 (alpha[t_idx] + z_t) * var[t_idx].rsqrt(),
             )
 
             if s_idx >= 0:
                 mu = (z_t - var[t_idx].sqrt() * c[s_idx]
                       * noise_hat) * alpha_st[s_idx]
-                z_t = mu + (var[s_idx] * c[s_idx]).sqrt() * \
-                    torch.randn_like(z_t)
+                z_t = mu + (var[s_idx] * c[s_idx]).sqrt() * torch.randn_like(z_t)
                 continue
-            final = (z_t - var[0].sqrt() * noise_hat) / alpha[0]
 
+            final = (z_t - var[0].sqrt() * noise_hat) / alpha[0]
         if rescale:
             final = self.mel[1].reverse(final)
+
         return final
 
+
     def training_step(self, batch, batch_idx):
-        midi, wav, *_ = batch
+        wav, *_ = batch
         spec = self.mel(wav)
         if len(_) > 0:
             context = _[0]
             context = self.mel(context)
         else:
             context = None
-        N = midi.shape[0]
+        N = wav.shape[0]
         dropout_mask = spec.new_empty(N).bernoulli_(self.cfg_dropout).bool()
         z_t, t, noise = self.get_training_inputs(spec)
-        noise_hat = self.model(midi, z_t, t, context,
+        noise_hat = self.model(z_t, t, context,
                                dropout_mask=dropout_mask)
         loss = F.l1_loss(noise_hat, noise)
 
@@ -165,7 +183,7 @@ class DiffusionLM(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        midi, wav, *_ = batch
+        wav, *_ = batch
         spec = self.mel(wav)
         if len(_) > 0:
             context = _[0]
@@ -173,7 +191,7 @@ class DiffusionLM(pl.LightningModule):
         else:
             context = None
         z_t, t, noise = self.get_training_inputs(spec, uniform=True)
-        noise_hat = self.model(midi, z_t, t, context)
+        noise_hat = self.model(z_t, t, context)
         loss = F.l1_loss(noise_hat, noise)
         return loss.item()
 
@@ -196,7 +214,7 @@ class DiffusionLM(pl.LightningModule):
         return super().on_test_start()
 
     def test_step(self, batch, batch_idx):
-        midi, orig_wav, *_ = batch
+        orig_wav, *_ = batch
         spec = self.mel(orig_wav)
         if len(_) > 0:
             context = _[0]
@@ -204,10 +222,10 @@ class DiffusionLM(pl.LightningModule):
         else:
             context = None
         z_t, t, noise = self.get_training_inputs(spec, uniform=True)
-        noise_hat = self.model(midi, z_t, t, context)
+        noise_hat = self.model(z_t, t, context)
         loss = F.l1_loss(noise_hat, noise)
-        pred = self.forward(
-            midi, seq_length=spec.shape[1], mel_context=context, verbose=False)
+        pred = self.forward(batch_size=spec.shape[0],
+            seq_length=spec.shape[1], mel_context=context, verbose=False)
         pred_wav = self.spec_to_wav(pred)
         orig_wav = orig_wav.cpu().numpy()
         metric = calculate_metrics(

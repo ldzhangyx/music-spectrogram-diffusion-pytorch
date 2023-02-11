@@ -22,7 +22,7 @@ class DiffusionEmbedding(nn.Module):
             t * self.max_steps, self.emb_dim, max_timescale=self.max_steps)
         emb = self.projection1(emb)
         emb = F.silu(emb)
-        emb = self.projection2(emb)
+        emb = self.projection2(emb )
         emb = F.silu(emb)
         return emb
 
@@ -158,11 +158,13 @@ class MIDI2SpecDiff(nn.Module):
         self.linear_out = nn.Linear(emb_dim, output_dim)
         self.diffusion_emb = DiffusionEmbedding(2e4, emb_dim, emb_dim * 4)
 
-    def forward(self, midi_tokens, spec, t, context=None, **kwargs):
+    def forward(self, spec, t, context=None, **kwargs):
         # spec: (batch, seq_len, output_dim)
         # midi_tokens: (batch, seq_len)
-        batch_size, seq_len = midi_tokens.shape
-        midi = self.emb(midi_tokens) + self.in_pos_emb[:seq_len]
+        batch_size, seq_len = spec.shape[:2]
+        midi_tokens_zero = torch.zeros(
+            batch_size, seq_len, dtype=torch.long, device=spec.device)
+        midi = self.emb(midi_tokens_zero) + self.in_pos_emb[:seq_len]
         spec = self.linear_in(spec) + self.out_pos_emb[:spec.shape[1]]
         diff_cond = self.diffusion_emb(t).unsqueeze(1)
         if context is not None:

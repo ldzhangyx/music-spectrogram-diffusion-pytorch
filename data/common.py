@@ -9,7 +9,6 @@ from note_seq import NoteSequence
 from tqdm import tqdm
 
 from preprocessor.event_codec import Codec
-from preprocessor.preprocessor import preprocess
 
 
 class Base(Dataset):
@@ -18,7 +17,7 @@ class Base(Dataset):
                  codec: Codec,
                  sample_rate: int = None,
                  segment_length: int = 81920,
-                 with_context: bool = False,
+                 with_context: bool = True,
                  **kwargs):
         super().__init__()
 
@@ -28,20 +27,16 @@ class Base(Dataset):
         total_num_tokens = 0
         empty_chunks = 0
         print("Preprocessing data...")
-        for filename, midi, sr, frames in tqdm(data_list):
+        for filename, sr, frames in tqdm(data_list):
             if sample_rate is None:
                 segment_length_in_time = segment_length / sr
             else:
                 segment_length_in_time = segment_length / sample_rate
             num_chunks = int(frames / (segment_length_in_time * sr))
-            tokens, _ = preprocess(
-                midi, segment_length=segment_length_in_time, codec=codec, **kwargs)
-            num_chunks = min(num_chunks, len(tokens))
-            empty_chunks += sum([1 for t in tokens if len(t) <= 1])
+            num_chunks = num_chunks
             boundaries.append(boundaries[-1] + num_chunks)
             self.data_list.append(
-                (filename, tokens, sr, segment_length_in_time))
-            total_num_tokens += sum([len(t) for t in tokens])
+                (filename, sr, segment_length_in_time))
 
         print(
             f'Total number of tokens: {total_num_tokens}, total number of chunks: {boundaries[-1]}, empty chunks: {empty_chunks}')
@@ -60,7 +55,7 @@ class Base(Dataset):
 
     def _get_waveforms(self, index: int, chunk_index: int) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Get waveform without resampling."""
-        wav_file, _, sr, length_in_time = self.data_list[index]
+        wav_file, sr, length_in_time = self.data_list[index]
         offset = int(chunk_index * length_in_time * sr)
         frames = int(length_in_time * sr)
 
@@ -84,9 +79,8 @@ class Base(Dataset):
         ctx = ctx.mean(axis=1)
         return data, ctx
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int):
         file_idx, chunk_idx = self._get_file_idx_and_chunk_idx(index)
-        tokens = self.data_list[file_idx][1][chunk_idx]
 
         if not self.with_context:
             data = self._get_waveforms(file_idx, chunk_idx)
@@ -96,7 +90,11 @@ class Base(Dataset):
                 if data.shape[0] < self.segment_length:
                     data = np.pad(
                         data, ((0, self.segment_length - data.shape[0]),), 'constant')
-            return tokens, data
+
+            # noised data
+            data = torch.from_numpy(data)
+
+            return data, None
 
         data, ctx = self._get_waveforms(file_idx, chunk_idx)
 
@@ -108,4 +106,4 @@ class Base(Dataset):
                 tmp = np.pad(
                     tmp, ((0, 0), (0, self.segment_length - tmp.shape[1])), 'constant')
             ctx, data = tmp
-        return tokens, data, ctx
+        return data, ctx

@@ -4,7 +4,6 @@ import torch
 from torch import nn
 import torch_optimizer as optim
 import torch.nn.functional as F
-from torchaudio.transforms import MelSpectrogram
 
 from models.ar_decoder import MIDI2SpecAR
 from .mel import MelFeature

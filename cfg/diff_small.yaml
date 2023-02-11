@@ -67,7 +67,7 @@ model:
     num_layers: 8
     cfg_dropout: 0.1
     cfg_weighting: 2.0
-    with_context: false
+    with_context: true
     dropout: 0.1
     layer_norm_eps: 1.0e-05
     norm_first: true
@@ -92,12 +92,7 @@ data:
   init_args:
     batch_size: 4
     midi_output_size: null
-    with_context: false
+    with_context: true
     sample_rate: 16000
     segment_length: 81920
-    musicnet_path: /import/c4dm-datasets/musicnet/
-    maestro_path: /import/c4dm-datasets/maestro-v3.0.0/
-    slakh_path: /import/c4dm-datasets/Slakh/slakh2100_flac_redux/
-    guitarset_path: /import/c4dm-datasets/GuitarSet/
-    urmp_wav_path: /import/c4dm-datasets/URMP/Dataset/
-    urmp_midi_path: /import/c4dm-datasets/URMP-clean-midi/
+    music4all_path: /import/c4dm-04/yz007/music4all
